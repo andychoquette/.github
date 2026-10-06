@@ -21,6 +21,14 @@ on:
         description: Repository name, used to gate against forks
         required: true
         type: string
+      owner:
+        # Parameterised rather than hardcoded to 'aws-deadline' so a fork can validate this
+        # workflow before it is merged, and so a staging mirror in another org can call it. The
+        # default keeps callers that omit it on the safe path.
+        description: Expected repository owner for the fork gate
+        required: false
+        default: aws-deadline
+        type: string
       branch:
         description: Branch to test
         required: false
@@ -62,8 +70,8 @@ permissions: {}
 jobs:
   IntegrationTest:
     # Matches the gate on reusable_integration_test.yml: a fork cannot mint a token that
-    # satisfies the role's trust policy anyway, but failing here is clearer than failing in STS.
-    if: github.repository == format('aws-deadline/{0}', inputs.repository)
+    # satisfies the role's trust policy anyway, but skipping here is clearer than failing in STS.
+    if: github.repository == format('{0}/{1}', inputs.owner, inputs.repository)
     name: Integration Tests (${{ inputs.os }})
     runs-on: ${{ inputs.os == 'linux' && 'ubuntu-latest' || inputs.os == 'windows' && 'windows-latest' || 'macos-15' }}
     # macOS is pinned rather than macos-latest. A moving image label has already broken a
