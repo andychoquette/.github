@@ -1,0 +1,137 @@
+name: Integration Test (native runner)
+
+# Runs a repository's integration suite directly on a GitHub-hosted runner, instead of
+# starting a CodeBuild project and polling it (see reusable_integration_test.yml).
+#
+# Only suitable for a repository whose integration tests reach AWS through public service
+# endpoints. deadline-cloud qualifies: its suite touches deadline, s3 and sts only, needs no
+# GPU, no DCC install, no licence endpoint, and nothing inside the test VPC. A repository that
+# launches EC2 workers over SSM (deadline-cloud-worker-agent) or needs a DCC licence endpoint
+# (the DCC submitters) cannot use this and must keep using the CodeBuild path.
+#
+# The trade this makes: the OIDC role is no longer a narrow "start one build" capability, it
+# carries the test permissions directly. Keep the role scoped to the suite's real needs and keep
+# the trust policy pinned to this file -- see ClientSoftwareIntegTestRole in
+# BealineClientSoftwareCDK.
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: Repository name, used to gate against forks
+        required: true
+        type: string
+      branch:
+        description: Branch to test
+        required: false
+        type: string
+      tag:
+        description: Tag to test; takes precedence over branch
+        required: false
+        type: string
+      environment:
+        description: GitHub environment holding the role ARN and region
+        required: false
+        default: mainline
+        type: string
+      os:
+        description: linux, windows or macos
+        required: true
+        type: string
+      python-version:
+        description: Python version used to run the suite
+        required: false
+        default: '3.13'
+        type: string
+      timeout-minutes:
+        # A tag run of the deadline-cloud suite is around 94 minutes against mainline's ~48, so
+        # the default leaves headroom without letting a hung suite hold a runner for 6 hours.
+        description: Wall-clock limit for the suite
+        required: false
+        default: 150
+        type: number
+    secrets:
+      AWS_INTEG_TEST_ROLE:
+        description: Role assumed to run the suite. Carries the test permissions directly.
+        required: true
+      AWS_REGION:
+        required: true
+
+permissions: {}
+
+jobs:
+  IntegrationTest:
+    # Matches the gate on reusable_integration_test.yml: a fork cannot mint a token that
+    # satisfies the role's trust policy anyway, but failing here is clearer than failing in STS.
+    if: github.repository == format('aws-deadline/{0}', inputs.repository)
+    name: Integration Tests (${{ inputs.os }})
+    runs-on: ${{ inputs.os == 'linux' && 'ubuntu-latest' || inputs.os == 'windows' && 'windows-latest' || 'macos-15' }}
+    # macOS is pinned rather than macos-latest. A moving image label has already broken a
+    # suite in this org once (see deadline-cloud-for-nuke integ_macos.yml), and an integration
+    # failure that turns out to be an image roll is expensive to diagnose. Note GitHub pins only
+    # the major label, so this reduces the exposure rather than removing it.
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      # Negative tests force timeouts and cancels, which otherwise emit error events into
+      # production client telemetry and trip the client error alarms. The CodeBuild path sets
+      # this on every test project; it has to be set here too.
+      DEADLINE_CLOUD_TELEMETRY_OPT_OUT: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || inputs.branch }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_INTEG_TEST_ROLE }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          # The suite runs for the whole session now; nothing refreshes these credentials
+          # mid-run. This has to exceed the suite's wall-clock time, and the role's
+          # MaxSessionDuration has to allow it or configure-aws-credentials fails immediately.
+          role-duration-seconds: 10800
+          mask-aws-account-id: true
+
+      - name: Resolve test environment
+        # Read from SSM rather than duplicating these into GitHub variables. The CDK writes them
+        # and recreates them when test infrastructure is replaced; a copy in GitHub would drift
+        # silently and the suite would fail against a farm that no longer exists.
+        #
+        # One call per parameter, by name. A single get-parameters call returns results in
+        # arbitrary order and silently omits names that do not exist, so positional reads are
+        # wrong and a missing parameter looks like an empty value. get-parameter exits non-zero
+        # instead, which set -e turns into the failure we want.
+        shell: bash
+        env:
+          QUEUE_PARAM: ${{ inputs.os == 'linux' && 'DeadlineCloudLinuxQueue' || inputs.os == 'windows' && 'DeadlineCloudWindowsQueue' || 'DeadlineCloudMacOSQueue' }}
+        run: |
+          set -euo pipefail
+          get() { aws ssm get-parameter --name "$1" --query Parameter.Value --output text; }
+          {
+            echo "FARM_ID=$(get TestFarmId)"
+            echo "QUEUE_ID=$(get "$QUEUE_PARAM")"
+            echo "JOB_ATTACHMENTS_BUCKET=$(get JobAttachmentsBucketName)"
+            echo "JA_TEST_ROOT_PREFIX=$(get JATestRootPrefix)"
+          } >> "$GITHUB_ENV"
+
+      - name: Run integration tests (POSIX)
+        if: inputs.os != 'windows'
+        shell: bash
+        run: ./pipeline/integ.sh
+
+      - name: Run integration tests (Windows)
+        if: inputs.os == 'windows'
+        shell: pwsh
+        run: ./pipeline/integ.ps1
